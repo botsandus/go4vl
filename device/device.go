@@ -32,6 +32,17 @@ func Open(path string, options ...Option) (*Device, error) {
 		return nil, fmt.Errorf("device open: %w", err)
 	}
 
+	// Close the fd unless setup below completes successfully. Every return
+	// after this point until the final `return dev, nil` is a failure, and
+	// several of them used to leak this fd.
+	// Dexory: fixes https://github.com/vladimirvivien/go4vl/issues/55.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = v4l2.CloseDevice(fd)
+		}
+	}()
+
 	dev := &Device{path: path, config: config{}, fd: fd}
 	// apply options
 	if len(options) > 0 {
@@ -43,9 +54,6 @@ func Open(path string, options ...Option) (*Device, error) {
 	// get capability
 	cap, err := v4l2.GetCapability(dev.fd)
 	if err != nil {
-		if err := v4l2.CloseDevice(dev.fd); err != nil {
-			return nil, fmt.Errorf("device %s: closing after failure: %s", path, err)
-		}
 		return nil, fmt.Errorf("device open: %s: %w", path, err)
 	}
 	dev.cap = cap
@@ -68,9 +76,6 @@ func Open(path string, options ...Option) (*Device, error) {
 	case cap.IsVideoOutputSupported():
 		dev.bufType = v4l2.BufTypeVideoOutput
 	default:
-		if err := v4l2.CloseDevice(dev.fd); err != nil {
-			return nil, fmt.Errorf("device open: %s: closing after failure: %s", path, err)
-		}
 		return nil, fmt.Errorf("device open: %s: %w", path, v4l2.ErrorUnsupportedFeature)
 	}
 
@@ -111,6 +116,7 @@ func Open(path string, options ...Option) (*Device, error) {
 		}
 	}
 
+	opened = true
 	return dev, nil
 }
 
