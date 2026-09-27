@@ -122,12 +122,20 @@ func Open(path string, options ...Option) (*Device, error) {
 
 // Close closes the underlying device associated with `d` .
 func (d *Device) Close() error {
+	var stopErr error
 	if d.streaming {
-		if err := d.Stop(); err != nil {
-			return err
-		}
+		stopErr = d.Stop()
 	}
-	return v4l2.CloseDevice(d.fd)
+
+	// Dexory: always attempt the actual close, even if Stop() failed, so the
+	// fd is guaranteed released on every path - callers must never retry a
+	// close() on the same fd number themselves.
+	closeErr := v4l2.CloseDevice(d.fd)
+
+	if stopErr != nil {
+		return stopErr
+	}
+	return closeErr
 }
 
 // Name returns the device name (or path)
@@ -356,6 +364,14 @@ func (d *Device) Start(ctx context.Context) error {
 	}
 
 	if err := d.startStreamLoop(ctx); err != nil {
+		// Dexory: buffers were successfully mapped above but streaming never
+		// started, so d.streaming stays false and Close() won't unmap them
+		// (it only calls Stop(), which does the unmap, when streaming is
+		// true). Unmap here so a failed Start() doesn't leak the mapping.
+		if unmapErr := v4l2.UnmapMemoryBuffers(d); unmapErr != nil {
+			return fmt.Errorf("device: start stream loop: %s (also failed to unmap buffers: %v)", err, unmapErr)
+		}
+		d.buffers = nil
 		return fmt.Errorf("device: start stream loop: %s", err)
 	}
 
