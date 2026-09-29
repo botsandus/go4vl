@@ -32,6 +32,17 @@ func Open(path string, options ...Option) (*Device, error) {
 		return nil, fmt.Errorf("device open: %w", err)
 	}
 
+	// Close the fd unless setup below completes successfully. Every return
+	// after this point until the final `return dev, nil` is a failure, and
+	// several of them used to leak this fd.
+	// Dexory: fixes https://github.com/vladimirvivien/go4vl/issues/55.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = v4l2.CloseDevice(fd)
+		}
+	}()
+
 	dev := &Device{path: path, config: config{}, fd: fd}
 	// apply options
 	if len(options) > 0 {
@@ -43,9 +54,6 @@ func Open(path string, options ...Option) (*Device, error) {
 	// get capability
 	cap, err := v4l2.GetCapability(dev.fd)
 	if err != nil {
-		if err := v4l2.CloseDevice(dev.fd); err != nil {
-			return nil, fmt.Errorf("device %s: closing after failure: %s", path, err)
-		}
 		return nil, fmt.Errorf("device open: %s: %w", path, err)
 	}
 	dev.cap = cap
@@ -68,9 +76,6 @@ func Open(path string, options ...Option) (*Device, error) {
 	case cap.IsVideoOutputSupported():
 		dev.bufType = v4l2.BufTypeVideoOutput
 	default:
-		if err := v4l2.CloseDevice(dev.fd); err != nil {
-			return nil, fmt.Errorf("device open: %s: closing after failure: %s", path, err)
-		}
 		return nil, fmt.Errorf("device open: %s: %w", path, v4l2.ErrorUnsupportedFeature)
 	}
 
@@ -111,17 +116,26 @@ func Open(path string, options ...Option) (*Device, error) {
 		}
 	}
 
+	opened = true
 	return dev, nil
 }
 
 // Close closes the underlying device associated with `d` .
 func (d *Device) Close() error {
+	var stopErr error
 	if d.streaming {
-		if err := d.Stop(); err != nil {
-			return err
-		}
+		stopErr = d.Stop()
 	}
-	return v4l2.CloseDevice(d.fd)
+
+	// Dexory: always attempt the actual close, even if Stop() failed, so the
+	// fd is guaranteed released on every path - callers must never retry a
+	// close() on the same fd number themselves.
+	closeErr := v4l2.CloseDevice(d.fd)
+
+	if stopErr != nil {
+		return stopErr
+	}
+	return closeErr
 }
 
 // Name returns the device name (or path)
@@ -350,6 +364,14 @@ func (d *Device) Start(ctx context.Context) error {
 	}
 
 	if err := d.startStreamLoop(ctx); err != nil {
+		// Dexory: buffers were successfully mapped above but streaming never
+		// started, so d.streaming stays false and Close() won't unmap them
+		// (it only calls Stop(), which does the unmap, when streaming is
+		// true). Unmap here so a failed Start() doesn't leak the mapping.
+		if unmapErr := v4l2.UnmapMemoryBuffers(d); unmapErr != nil {
+			return fmt.Errorf("device: start stream loop: %s (also failed to unmap buffers: %v)", err, unmapErr)
+		}
+		d.buffers = nil
 		return fmt.Errorf("device: start stream loop: %s", err)
 	}
 
@@ -407,7 +429,9 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 					if errors.Is(err, sys.EAGAIN) {
 						continue
 					}
-					panic(fmt.Sprintf("device: stream loop dequeue: %s", err))
+					// Dexory: do not panic here, just continue (the error may be temporary)
+					// panic(fmt.Sprintf("device: stream loop dequeue: %s", err))
+					continue
 				}
 
 				// copy mapped buffer (copying avoids polluted data from subsequent dequeue ops)
@@ -423,7 +447,9 @@ func (d *Device) startStreamLoop(ctx context.Context) error {
 				}
 
 				if _, err := v4l2.QueueBuffer(fd, ioMemType, bufType, buff.Index); err != nil {
-					panic(fmt.Sprintf("device: stream loop queue: %s: buff: %#v", err, buff))
+					// Dexory: do not panic here, just continue (the error may be temporary)
+					// panic(fmt.Sprintf("device: stream loop queue: %s: buff: %#v", err, buff))
+					continue
 				}
 			case <-ctx.Done():
 				d.Stop()
